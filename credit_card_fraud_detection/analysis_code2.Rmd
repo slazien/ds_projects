@@ -1,0 +1,260 @@
+---
+title: "Credit card fraud detection using Machine Learning"
+output: html_notebook
+author: Przemyslaw Zientala
+date: 20-11-2017
+---
+
+# Problem
+Credit card fraud is a major concern in the financial industry nowadays. It is estimated that £20M a day were lost due to fraudulent transactions in 2016 alone, totalling almost £770M annually (Financial Fraud Actoin UK; https://www.financialfraudaction.org.uk/fraudfacts16/assets/fraud_the_facts.pdf).
+
+Analysing fraudulent transactions manually is unfeasible due to huge amounts of data and its complexity. However, given sufficiently informative features, one could expect it is possible to do using Machine Learning. This hypothesis will be explored in the project.
+
+# Data description
+The datasets contains transactions made by credit cards in September 2013 by european cardholders. This dataset presents transactions that occurred in two days, where we have 492 frauds out of 284,807 transactions. The dataset is highly unbalanced, the positive class (frauds) account for 0.172% of all transactions.
+
+It contains only numerical input variables which are the result of a PCA transformation. Unfortunately, due to confidentiality issues, we cannot provide the original features and more background information about the data. Features V1, V2, ... V28 are the principal components obtained with PCA, the only features which have not been transformed with PCA are 'Time' and 'Amount'. Feature 'Time' contains the seconds elapsed between each transaction and the first transaction in the dataset. The feature 'Amount' is the transaction Amount, this feature can be used for example-dependant cost-senstive learning. Feature 'Class' is the response variable and it takes value 1 in case of fraud and 0 otherwise.
+
+Given the class imbalance ratio, we recommend measuring the accuracy using the Area Under the Precision-Recall Curve (AUPRC). Confusion matrix accuracy is not meaningful for unbalanced classification.
+
+The dataset has been collected and analysed during a research collaboration of Worldline and the Machine Learning Group (http://mlg.ulb.ac.be) of ULB (Université Libre de Bruxelles) on big data mining and fraud detection. More details on current and past projects on related topics are available on http://mlg.ulb.ac.be/BruFence and http://mlg.ulb.ac.be/ARTML
+
+Please cite: Andrea Dal Pozzolo, Olivier Caelen, Reid A. Johnson and Gianluca Bontempi. Calibrating Probability with Undersampling for Unbalanced Classification. In Symposium on Computational Intelligence and Data Mining (CIDM), IEEE, 2015
+
+# Exploratory data analysis and data cleaning
+
+## Exploratory analysis
+```{r,message=FALSE,warning=FALSE,error=FALSE}
+# Load libraries
+library(data.table)
+library(ggplot2)
+
+library(plyr)
+library(dplyr)
+library(corrplot)
+library(pROC)
+
+library(glmnet)
+library(caret)
+library(Rtsne)
+
+library(doMC)
+```
+
+```{r}
+# Load data
+data <- fread("data/creditcard.csv")
+head(data)
+```
+
+All the features, apart from "time" and "amount" are anonymised. Let's look at the distribution of class labels.
+
+```{r}
+apply(data, 2, function(x) sum(is.na(x)))
+```
+
+Good news! There are no NA values in the data.
+
+```{r}
+common_theme <- theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+p <- ggplot(data, aes(x = Class)) + geom_bar() + ggtitle("Number of class labels") + common_theme
+print(p)
+```
+
+Clearly, the dataset is extremely unbalanced. Even a "null" classifier which always predicts class=0 would obtain over 99% accuracy on this task. This demonstrates that a simple measure of mean accuracy should not be used due to insensitivity to false negatives. 
+
+**The most appropriate measures to use on this task would be:**
+
+1. Precision
+2. Recall
+3. F-1 score (harmonic mean of precision and recall)
+4. AUC (area under precision-recall curve)
+
+**Additionally, we can transform the data itself in numerous ways:**
+
+1. Oversampling
+2. Undersampling
+3. SMOTE (Synthetic Minority Over-sampling Technique)
+
+
+```{r}
+summary(data)
+```
+
+All the anonymised features seem to have been be normalised with mean 0. We will apply that transformation to the "Amount" column later on to facilitate training ML models.
+
+Having normalized the "Amount" column, it is important to see how informative that feature would be in predicting whether a transaction was fraudulent. Hence, let's plot the amount against the class of transaction.
+
+```{r}
+p <- ggplot(data, aes(x = Class, y = Amount)) + geom_boxplot() + ggtitle("Distribution of transaction amount by class") + common_theme
+print(p)
+```
+
+There is clearly a lot more variability in the transaction values for non-fraudulent transactions. To get a fuller picture, let's compute the mean and median values for each class.
+
+```{r}
+data %>% group_by(Class) %>% summarise(mean(Amount), median(Amount))
+```
+
+fraudulent transactions seem to have higher mean value than non-fraudulent ones, meaning that this feature would likely be useful to use in the predictive model. However, the median is higher for the legitimate ones, meaning the distribution of values for class "0" is left-skewed (also seen on the boxplot above).
+
+Since almost all the features are anonymised, let's see whether there are any correlations with the "Class" feature.
+
+```{r}
+data$Class <- as.numeric(data$Class)
+corr_plot <- corrplot(cor(data[,-c("Time")]), method = "circle", type = "upper")
+```
+
+There are a couple interesting correlations with the "Amount" and "Class" features. We will focus on these variables later on during feature selection for the model.
+
+ Let's apply that transformation to the "Amount" column too.
+
+```{r}
+normalize <- function(x)
+      return((x - mean(x, na.rm = TRUE))/sd(x, na.rm = TRUE))
+data$Amount <- normalize(data$Amount)
+```
+
+### Visualization of transactions using t-SNE
+To try to understand the data better, we will try visualizing the data using [t-Distributed Stochastic Neighbour Embedding](https://lvdmaaten.github.io/tsne/), a technique to reduce dimensionality using Barnes-Hut approximations.
+
+To train the model, perplexity was set to 20. This was based on experimentation and there is no "best" value to use. However, the author of the algorithm suggests using a value of 5-50.
+
+The visualisation should give us a hint as to whether there exist any "discoverable" patterns in the data which the model could learn. If there is no obvious structure in the data, it is more likely that the model will perform poorly.
+
+```{r}
+# Use 10% of data to compute t-SNE
+tsne_subset <- 1:as.integer(0.1*nrow(data))
+tsne <- Rtsne(data[tsne_subset,-c("Class", "Time")], perplexity = 20, theta = 0.5, pca = F, verbose = T, max_iter = 500, check_duplicates = F)
+classes <- as.factor(data$Class[tsne_subset])
+tsne_mat <- as.data.frame(tsne$Y)
+ggplot(tsne_mat, aes(x = V1, y = V2)) + geom_point(aes(color = classes)) + common_theme + ggtitle("t-SNE visualisation of transactions")
+```
+ 
+Luckily, there is a rather clear distinction between legitimate and fraudulent transactions, which seem to lie at the edge of the "blob" of data. This is encouraging news, let's see whether we can make our models detect fraudulent trransactions!
+
+
+# Model development
+
+To avoid developing a "naive" model, we should make sure the classes are roughly balanced. Therefore, we will use a resampling (and, more precisely, oversampling) scheme called SMOTE. It works roughly as follows:
+
+1. The algorithm selects 2 or more similar instances of data
+2. It then perturbs each instance one feature at a time by a random amount. This amount is within the distance to the neighbouring examples.
+
+**SMOTE has been shown to perform better classification performance in the ROC space than either over- or undersampling** *(From Nitesh V. Chawla, Kevin W. Bowyer, Lawrence O. Hall and W. Philip Kegelmeyer’s “SMOTE: Synthetic Minority Over-sampling Technique” (Journal of Artificial Intelligence Research, 2002, Vol. 16, pp. 321–357))*. **Since ROC is the measure we are going to optimize for, we will use SMOTE to resample the data.**
+
+```{r,echo=TRUE}
+# Set random seed for reproducibility
+set.seed(42)
+
+# Transform "Class" to factor to perform classification and rename levels to predict class probabilities (need to be valid R variable names)
+data$Class <- as.factor(data$Class)
+data$Class <- revalue(data$Class, c("0"="false", "1"="true"))
+data$Class <- factor(data$Class, levels(data$Class)[c(2, 1)])
+
+# Create training and testing set with stratification (i.e. preserving the proportions of false/true values from the "Class" column)
+train_index <- createDataPartition(data$Class, times = 1, p = 0.8, list = F)
+X_train <- data[train_index]
+X_test <- data[!train_index]
+y_train <- as.logical(as.factor(data$Class[train_index]))
+y_test <- as.logical(as.factor(data$Class[-train_index]))
+
+# Parallel processing for faster training
+registerDoMC(cores = 8)
+
+# Use 10-fold cross-validation
+ctrl <- trainControl(method = "cv",
+                     number = 10,
+                     verboseIter = T,
+                     classProbs = T,
+                     sampling = "smote",
+                     summaryFunction = twoClassSummary,
+                     savePredictions = T)
+```
+
+**It is typically a good idea to start out with a simple model and move on to more complex ones to have a rough idea of what "good" performance means on our data.** Moroever, it is important to consider the tradeoff between model accuracy and model complexity (which is inherently tied to computational cost). It might be the case that having a simple model with short inference times which achieves an accuracy of 85% is sufficient for a given task, as opposed to having a, say, 10-layer neural network which trains for 2 days on a GPU cluster and is 90% accurate.
+
+Therefore, we will start out with logistic regression.
+
+### Logistic regression
+
+Logistic regression is a simple regression model whose output is a score between 0 and 1. This is achieved by using the logistic function:
+
+$$g(z) = \frac{1}{1 + exp(-z)}$$
+Where:
+$$z = \beta^T x$$
+
+The model can be fitted using gradient descent on the paramter vector. Equipped with some basic information, let's fit the model and see how it performs!
+
+```{r}
+log_mod <- glm(Class ~ ., family = "binomial", data = X_train)
+summary(log_mod)
+```
+
+```{r}
+# Use a threshold of 0.5 to transform predictions to binary
+conf_mat <- confusionMatrix(y_test, predict(log_mod, X_test, type = "response") > 0.5, positive = "TRUE")
+print(conf_mat)
+```
+
+A simple logistic regression model achieved nearly 100% accuracy, with ~68% precision (positive predictive value) and ~89% recall (sensitivity). We can see there are only 7 false negatives (transactions which were fraudulent in reality but ont identified as such by the model). This means that the baseline model will be very hard to beat.
+
+```{r}
+fourfoldplot(conf_mat$table)
+```
+
+We can further minimise the number of false negatives by increasing the classification threshold. However, this comes at the expense of identifying some legitiate transactions as fraudulent. This is typically of much lesser concern to banks and it is the false negative rate that should be minimized.
+
+```{r}
+conf_mat2 <- confusionMatrix(y_test, predict(log_mod, X_test, type = "response") > 0.6, positive = "TRUE")
+print(conf_mat2)
+```
+
+Now we have just 2 false negatives, but we identified many more legitimate transactions as fraudulent compared to 0.5 threshold. Also, precision dropped to 65% whihle recall increased to 90%. We can vary the threshold to obtain an optimal tradeoff, or look at the ROC curve to guide us.
+
+```{r}
+roc_logmod <- roc(y_test, predict(log_mod, X_test, type = "response"))
+plot(roc_logmod, main = paste0("AUC: ", round(pROC::auc(roc_logmod), 3)))
+```
+
+Let's now move on to Random Forest and see whether we can improve any further.
+
+### Random Forest
+
+```{r,message=FALSE,warning=FALSE}
+# Train a Random Forest classifier, maximising recall (sensitivity)
+model_rf_smote <- train(Class ~ ., data = X_train, method = "rf", trControl = ctrl, verbose = T, metric = "sensitivity")
+```
+
+The code above uses SMOTE to resample the data, performs 10-fold CV and trains a Random Forest classifier using ROC as metric to maximize. Let's look at its performance!
+
+```{r}
+model_rf_smote
+```
+
+**It is important to note that SMOTE resampling was done only on the training data**. The reason for that is if we performed it on the whole dataset and then made the split, SMOTE would *bleed* some information into the testing set, thereby biasing the results in an optimistic way.
+
+The results on the training set look very promising. Let's see how the model performs on the unseen test set.
+
+```{r}
+preds <- as.logical(predict(model_rf_smote, X_test))
+conf_mat_rf <- confusionMatrix(preds, y_test, positive = "TRUE")
+print(conf_mat_rf)
+```
+
+```{r}
+roc_data <- roc(y_test, predict(model_rf_smote, X_test, type = "prob")$false)
+plot(roc_data, main = paste0("AUC: ", round(pROC::auc(roc_data), 3)))
+```
+
+The RF model achieved 30% precision and 86% recall. As can be seen above, it also achieves marginally higher AUC score compared to logistic regression.
+
+```{r}
+plot(varImp(model_rf_smote))
+```
+
+
+It is interesting to compare variable importances of the RF model with the variables identified earlier as correlated with the "Class" variable. The top 3 most important variables in the RF model were also the ones which were most correlated with the "Class" variable. Especially for large datasets, this means we could save disk space and computation time by only training the model on the most correlated/important variables, sacrificing a bit of model accuracy.
+
+# Summary
+This project has explored the task of identifying fraudlent transactions based on a dataset of anonymised features. It has been shown that even a very simple logistic regression model can achieve good recall, while a much more complex Random Forest model improves upon
