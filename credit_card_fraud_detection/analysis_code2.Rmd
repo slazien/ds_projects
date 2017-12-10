@@ -2,11 +2,10 @@
 title: "Credit card fraud detection using Machine Learning"
 output: html_notebook
 author: Przemyslaw Zientala
-date: 20-11-2017
 ---
 
 # Problem
-Credit card fraud is a major concern in the financial industry nowadays. It is estimated that £20M a day were lost due to fraudulent transactions in 2016 alone, totalling almost £770M annually (Financial Fraud Actoin UK; https://www.financialfraudaction.org.uk/fraudfacts16/assets/fraud_the_facts.pdf).
+Credit card fraud is a major concern in the financial industry nowadays. It is estimated that £20M a day were lost due to fraudulent transactions in 2016 alone, totalling almost £770M annually (Financial Fraud Action UK; https://www.financialfraudaction.org.uk/fraudfacts16/assets/fraud_the_facts.pdf).
 
 Analysing fraudulent transactions manually is unfeasible due to huge amounts of data and its complexity. However, given sufficiently informative features, one could expect it is possible to do using Machine Learning. This hypothesis will be explored in the project.
 
@@ -37,6 +36,7 @@ library(pROC)
 library(glmnet)
 library(caret)
 library(Rtsne)
+library(xgboost)
 
 library(doMC)
 ```
@@ -47,7 +47,7 @@ data <- fread("data/creditcard.csv")
 head(data)
 ```
 
-All the features, apart from "time" and "amount" are anonymised. Let's look at the distribution of class labels.
+All the features, apart from "time" and "amount" are anonymised. Let's see whether there is any missing data.
 
 ```{r}
 apply(data, 2, function(x) sum(is.na(x)))
@@ -128,10 +128,10 @@ tsne_subset <- 1:as.integer(0.1*nrow(data))
 tsne <- Rtsne(data[tsne_subset,-c("Class", "Time")], perplexity = 20, theta = 0.5, pca = F, verbose = T, max_iter = 500, check_duplicates = F)
 classes <- as.factor(data$Class[tsne_subset])
 tsne_mat <- as.data.frame(tsne$Y)
-ggplot(tsne_mat, aes(x = V1, y = V2)) + geom_point(aes(color = classes)) + common_theme + ggtitle("t-SNE visualisation of transactions")
+ggplot(tsne_mat, aes(x = V1, y = V2)) + geom_point(aes(color = classes)) + theme_minimal() + common_theme + ggtitle("t-SNE visualisation of transactions") + scale_color_manual(values = c("#E69F00", "#56B4E9"))
 ```
  
-Luckily, there is a rather clear distinction between legitimate and fraudulent transactions, which seem to lie at the edge of the "blob" of data. This is encouraging news, let's see whether we can make our models detect fraudulent trransactions!
+Luckily, there is a rather clear distinction between legitimate and fraudulent transactions, which seem to lie at the edge of the "blob" of data. This is encouraging news, let's see whether we can make our models detect fraudulent transactions!
 
 
 # Model development
@@ -148,16 +148,16 @@ To avoid developing a "naive" model, we should make sure the classes are roughly
 set.seed(42)
 
 # Transform "Class" to factor to perform classification and rename levels to predict class probabilities (need to be valid R variable names)
-data$Class <- as.factor(data$Class)
-data$Class <- revalue(data$Class, c("0"="false", "1"="true"))
-data$Class <- factor(data$Class, levels(data$Class)[c(2, 1)])
+data$Class <- as.numeric(data$Class)
+#data$Class <- revalue(data$Class, c("0"="false", "1"="true"))
+#data$Class <- factor(data$Class, levels(data$Class)[c(2, 1)])
 
 # Create training and testing set with stratification (i.e. preserving the proportions of false/true values from the "Class" column)
 train_index <- createDataPartition(data$Class, times = 1, p = 0.8, list = F)
 X_train <- data[train_index]
 X_test <- data[!train_index]
-y_train <- as.logical(as.factor(data$Class[train_index]))
-y_test <- as.logical(as.factor(data$Class[-train_index]))
+y_train <- data$Class[train_index]
+y_test <- data$Class[-train_index]
 
 # Parallel processing for faster training
 registerDoMC(cores = 8)
@@ -184,7 +184,7 @@ $$g(z) = \frac{1}{1 + exp(-z)}$$
 Where:
 $$z = \beta^T x$$
 
-The model can be fitted using gradient descent on the paramter vector. Equipped with some basic information, let's fit the model and see how it performs!
+The model can be fitted using gradient descent on the parameter vector beta. Equipped with some basic information, let's fit the model and see how it performs!
 
 ```{r}
 log_mod <- glm(Class ~ ., family = "binomial", data = X_train)
@@ -193,11 +193,11 @@ summary(log_mod)
 
 ```{r}
 # Use a threshold of 0.5 to transform predictions to binary
-conf_mat <- confusionMatrix(y_test, predict(log_mod, X_test, type = "response") > 0.5, positive = "TRUE")
+conf_mat <- confusionMatrix(y_test, as.numeric(predict(log_mod, X_test, type = "response") > 0.5))
 print(conf_mat)
 ```
 
-A simple logistic regression model achieved nearly 100% accuracy, with ~68% precision (positive predictive value) and ~89% recall (sensitivity). We can see there are only 7 false negatives (transactions which were fraudulent in reality but ont identified as such by the model). This means that the baseline model will be very hard to beat.
+A simple logistic regression model achieved nearly 100% accuracy, with ~99% precision (positive predictive value) and ~100% recall (sensitivity). We can see there are only 6 false negatives (transactions which were fraudulent in reality but ont identified as such by the model). This means that the baseline model will be very hard to beat.
 
 ```{r}
 fourfoldplot(conf_mat$table)
@@ -206,14 +206,14 @@ fourfoldplot(conf_mat$table)
 We can further minimise the number of false negatives by increasing the classification threshold. However, this comes at the expense of identifying some legitiate transactions as fraudulent. This is typically of much lesser concern to banks and it is the false negative rate that should be minimized.
 
 ```{r}
-conf_mat2 <- confusionMatrix(y_test, predict(log_mod, X_test, type = "response") > 0.6, positive = "TRUE")
+conf_mat2 <- confusionMatrix(y_test, as.numeric(predict(log_mod, X_test, type = "response") > 0.999))
 print(conf_mat2)
 ```
 
-Now we have just 2 false negatives, but we identified many more legitimate transactions as fraudulent compared to 0.5 threshold. Also, precision dropped to 65% whihle recall increased to 90%. We can vary the threshold to obtain an optimal tradeoff, or look at the ROC curve to guide us.
+Now we have just 2 false negatives, but we identified many more legitimate transactions (72) as fraudulent compared to 0.5 threshold. When adjusting the classification threshold, we can have a look at the ROC curve to guide us.
 
 ```{r}
-roc_logmod <- roc(y_test, predict(log_mod, X_test, type = "response"))
+roc_logmod <- roc(y_test, as.numeric(predict(log_mod, X_test, type = "response")))
 plot(roc_logmod, main = paste0("AUC: ", round(pROC::auc(roc_logmod), 3)))
 ```
 
@@ -223,7 +223,10 @@ Let's now move on to Random Forest and see whether we can improve any further.
 
 ```{r,message=FALSE,warning=FALSE}
 # Train a Random Forest classifier, maximising recall (sensitivity)
-model_rf_smote <- train(Class ~ ., data = X_train, method = "rf", trControl = ctrl, verbose = T, metric = "sensitivity")
+X_train_rf <- X_train
+X_train_rf$Class <- as.factor(X_train_rf$Class)
+levels(X_train_rf$Class) <- make.names(c(0, 1))
+model_rf_smote <- train(Class ~ ., data = X_train_rf, method = "rf", trControl = ctrl, verbose = T, metric = "ROC")
 ```
 
 The code above uses SMOTE to resample the data, performs 10-fold CV and trains a Random Forest classifier using ROC as metric to maximize. Let's look at its performance!
@@ -237,17 +240,17 @@ model_rf_smote
 The results on the training set look very promising. Let's see how the model performs on the unseen test set.
 
 ```{r}
-preds <- as.logical(predict(model_rf_smote, X_test))
-conf_mat_rf <- confusionMatrix(preds, y_test, positive = "TRUE")
+preds <- predict(model_rf_smote, X_test, type = "prob")
+conf_mat_rf <- confusionMatrix(as.numeric(preds$X1 > 0.5), y_test)
 print(conf_mat_rf)
 ```
 
 ```{r}
-roc_data <- roc(y_test, predict(model_rf_smote, X_test, type = "prob")$false)
+roc_data <- roc(y_test, predict(model_rf_smote, X_test, type = "prob")$X1)
 plot(roc_data, main = paste0("AUC: ", round(pROC::auc(roc_data), 3)))
 ```
 
-The RF model achieved 30% precision and 86% recall. As can be seen above, it also achieves marginally higher AUC score compared to logistic regression.
+The RF model achieved ~100% precision and 98% recall, which is - surprisingly - lower than for logistic regression. This might be due to the fact that Random Forest has too high model capacity and hence overfits to training data. As can be seen above, it also achieves marginally higher AUC score compared to logistic regression (since that's what the objective function was).
 
 ```{r}
 plot(varImp(model_rf_smote))
@@ -256,5 +259,23 @@ plot(varImp(model_rf_smote))
 
 It is interesting to compare variable importances of the RF model with the variables identified earlier as correlated with the "Class" variable. The top 3 most important variables in the RF model were also the ones which were most correlated with the "Class" variable. Especially for large datasets, this means we could save disk space and computation time by only training the model on the most correlated/important variables, sacrificing a bit of model accuracy.
 
+Lastly, we can also try *XGBoost*, which is based on Gradient Boosted Trees and is a more powerful model compared to both Logistic Regression and Random Forest.
+
+```{r}
+dtrain_X <- xgb.DMatrix(data = as.matrix(X_train[,-c("Class")]), label = as.numeric(X_train$Class))
+dtest_X <- xgb.DMatrix(data = as.matrix(X_test[,-c("Class")]), label = as.numeric(X_test$Class))
+xgb <- xgboost(data = dtrain_X, nrounds = 100, gamma = 0.1, max_depth = 10, objective = "binary:logistic", nthread = 7)
+preds_xgb <- predict(xgb, dtest_X)
+confusionMatrix(as.numeric(preds_xgb > 0.5), y_test)
+```
+
+We can see the model performs much better than the previous ones, espeically in terms of Negative Predictive Value, while still achieving nearly ~100% precision and recall on the validation set! Once again, we can set the classification threshold using the ROC curve.
+
+```{r}
+roc_xgb <- roc(y_test, preds_xgb)
+plot(roc_xgb, main = paste0("AUC: ", round(pROC::auc(roc_xgb), 3)))
+```
+
+
 # Summary
-This project has explored the task of identifying fraudlent transactions based on a dataset of anonymised features. It has been shown that even a very simple logistic regression model can achieve good recall, while a much more complex Random Forest model improves upon
+This project has explored the task of identifying fraudlent transactions based on a dataset of anonymised features. It has been shown that even a very simple logistic regression model can achieve good recall, while a much more complex Random Forest model improves upon logistic regression in terms of AUC. However, XGBoost model improves upon both models.
