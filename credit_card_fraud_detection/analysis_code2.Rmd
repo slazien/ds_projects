@@ -110,8 +110,9 @@ There are a couple interesting correlations with the "Amount" and "Class" featur
  Let's apply that transformation to the "Amount" column too.
 
 ```{r}
-normalize <- function(x)
+normalize <- function(x){
       return((x - mean(x, na.rm = TRUE))/sd(x, na.rm = TRUE))
+}
 data$Amount <- normalize(data$Amount)
 ```
 
@@ -258,6 +259,8 @@ plot(varImp(model_rf_smote))
 
 
 It is interesting to compare variable importances of the RF model with the variables identified earlier as correlated with the "Class" variable. The top 3 most important variables in the RF model were also the ones which were most correlated with the "Class" variable. Especially for large datasets, this means we could save disk space and computation time by only training the model on the most correlated/important variables, sacrificing a bit of model accuracy.
+
+### XGBoost
 
 Lastly, we can also try *XGBoost*, which is based on Gradient Boosted Trees and is a more powerful model compared to both Logistic Regression and Random Forest.
 
